@@ -1,7 +1,9 @@
+
 import torch
 from mmcv.runner.fp16_utils import force_fp32
 from mmdet.core import bbox2roi, multi_apply
 from mmdet.models import DETECTORS, build_detector
+from mmdet.core.bbox.iou_calculators import bbox_overlaps
 
 from ssod.utils.structure_utils import dict_split, weighted_loss
 from ssod.utils import log_image_with_boxes, log_every_n
@@ -64,13 +66,8 @@ class SoftTeacher(MultiSteamDetector):
         with torch.no_grad():
             teacher_info = self.extract_teacher_info(
                 teacher_data["img"][
-                    torch.Tensor(tidx).to(teacher_data["img"].device).long()
-                ],
-                [teacher_data["img_metas"][idx] for idx in tidx],
-                [teacher_data["proposals"][idx] for idx in tidx]
-                if ("proposals" in teacher_data)
-                and (teacher_data["proposals"] is not None)
-                else None,
+                    torch.Tensor(tidx).to(teacher_data["img"].device).long()],
+                [teacher_data["img_metas"][idx] for idx in tidx]
             )
         student_info = self.extract_student_info(**student_data)
 
@@ -272,7 +269,9 @@ class SoftTeacher(MultiSteamDetector):
             [bbox[:, :4] for bbox in pseudo_bboxes],
             pseudo_labels,
             [-bbox[:, 5:].mean(dim=-1) for bbox in pseudo_bboxes],
-            thr=-self.train_cfg.reg_pseudo_threshold,
+            # thr=-self.train_cfg.reg_pseudo_threshold,
+            thr=-0.2,
+
         )
         log_every_n(
             {"rcnn_reg_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
@@ -343,62 +342,182 @@ class SoftTeacher(MultiSteamDetector):
             for meta in img_metas
         ]
         return student_info
+    
 
-    def extract_teacher_info(self, img, img_metas, proposals=None, **kwargs):
+    @staticmethod
+    def aug_img(img, img_metas, times=4, std=0.03):
+        def gasuss_noise(img, img_metas, mean=0, std=0.03):
+            b = len(img)
+            img_shapes = [meta['img_shape'] for meta in img_metas]
+
+            for i in range(b):
+                h, w, _ = img_shapes[i]
+                crop_img = img[i][:, :h, :w]
+                min_value = crop_img.min()
+                max_value = crop_img.max()
+
+                noise = torch.randn_like(crop_img) * std + mean
+                crop_img = (crop_img - min_value) / (max_value - min_value)
+                crop_img = crop_img + noise
+
+                _min_value = crop_img.min()
+                _max_value = crop_img.max()
+
+                crop_img = (crop_img - _min_value) / (_max_value - _min_value)
+                crop_img = crop_img  * (max_value - min_value) + min_value
+
+                img[i, :, :h, :w] = crop_img
+            return img
+        
+        imgs = []
+        from PIL import Image
+        import numpy as np
+        for i in range(times):
+            img = gasuss_noise(img, img_metas)
+            imgs.append(img)
+
+            f = lambda x: ((x - x.min()) / (x.max() - x.min())).detach().cpu().numpy().astype(np.float32) * 255
+            Image.fromarray(f(img[0].permute(1, 2, 0)).astype(np.uint8)[:,:,::-1]).save(f'{i}.jpg')
+        return imgs
+
+
+    def compute_uncertainty(
+        self, noise_levels_proposal_list, noise_levels_proposal_label_list
+    ):
+        # per image
+        batch_size = len(noise_levels_proposal_list[0])
+        noise_levels = len(noise_levels_proposal_list)
+        box_unc = []
+        
+        for bs in range(batch_size):
+            
+            proposal_list = [noise_levels_proposal_list[l][bs] for l in range(noise_levels)]
+            proposal_label_list = [noise_levels_proposal_label_list[l][bs] for l in range(noise_levels)]
+
+            # flatten
+            proposal_list = [
+                pl.reshape(-1, pl.shape[-1]) for pl in proposal_list
+            ]
+ 
+            det_bboxes = proposal_list[0]
+            det_labels = proposal_label_list[0]
+
+            reg_unc = []
+            prob_unc = []
+
+            for l in range(1, noise_levels):
+                n = len(det_bboxes)
+                m = len(proposal_list[l])
+                p_unc = []
+                r_unc = []
+
+                if m != 0:
+                    # 相对于原来的boxes 有多少改变
+                    ious = bbox_overlaps(det_bboxes[:, :4], proposal_list[l][:, :4])
+                    probs = proposal_list[l][:, 4]
+
+                    # 对于每一个真实框，都要找到一个预测框与之对应
+                    # 如果找不到 index就为-1
+                    max_index = []
+                    for j in range(n):
+                        if j == 0:
+                            max_index.append(ious.argmax(1)[j])
+                        else:
+                            if ious.argmax(1)[j] not in ious.argmax(1)[:j]:
+                                max_index.append(ious.argmax(1)[j])
+                            else:
+                                max_index.append(-1)
+
+                    for j in range(n):
+                        if max_index[j] == -1:
+                            # 丢失
+                            # 不稳定
+                            # 如果更早噪声level就丢失，那么不确定性就高
+                            p_unc.append(torch.as_tensor(1.0, device=det_bboxes.device))
+                            r_unc.append(torch.as_tensor(1.0, device=det_bboxes.device))
+                        else:
+                            p_unc.append((det_bboxes[:, 4][j] - proposal_list[l][:, 4][max_index[j]]).clamp(min=0))
+                            r_unc.append((1 - ious[j, max_index[j]]).clamp(min=0))
+
+                    p_unc = torch.stack(p_unc)
+                    r_unc = torch.stack(r_unc)
+                    
+                    prob_unc.append(p_unc)
+                    reg_unc.append(r_unc)
+                else:
+                    # 如果噪声大到检不出
+                    prob_unc.append(torch.ones(n, device=det_bboxes.device))
+                    reg_unc.append(torch.ones(n, device=det_bboxes.device))
+            prob_unc = torch.stack(prob_unc).mean(0)[:, None]
+            reg_unc = torch.stack(reg_unc).mean(0)[:, None]
+            unc = 0.7 * reg_unc + 0.3 * prob_unc
+            box_unc.append(unc)
+        return box_unc
+    
+
+
+
+    def extract_teacher_info(self, img, img_metas, **kwargs):
         teacher_info = {}
-        feat = self.teacher.extract_feat(img)
-        teacher_info["backbone_feature"] = feat
-        if proposals is None:
-            proposal_cfg = self.teacher.train_cfg.get(
-                "rpn_proposal", self.teacher.test_cfg.rpn
-            )
-            rpn_out = list(self.teacher.rpn_head(feat))
-            proposal_list = self.teacher.rpn_head.get_bboxes(
-                *rpn_out, img_metas=img_metas, cfg=proposal_cfg
-            )
-        else:
-            proposal_list = proposals
-        teacher_info["proposals"] = proposal_list
 
-        proposal_list, proposal_label_list = self.teacher.roi_head.simple_test_bboxes(
-            feat, img_metas, proposal_list, self.teacher.test_cfg.rcnn, rescale=False
-        )
+        noise_levels_proposal_list = []
+        noise_levels_proposal_label_list = []
+        
+        imgs = [img] + self.aug_img(img, img_metas, times=4, std=0.03)
+        for i in range(len(imgs)):
+            img = imgs[i]
+            feat = self.teacher.extract_feat(img)
+        
+            proposal_list = self.teacher.rpn_head.simple_test_rpn(feat, img_metas)
 
-        proposal_list = [p.to(feat[0].device) for p in proposal_list]
-        proposal_list = [
-            p if p.shape[0] > 0 else p.new_zeros(0, 5) for p in proposal_list
-        ]
-        proposal_label_list = [p.to(feat[0].device) for p in proposal_label_list]
-        # filter invalid box roughly
-        if isinstance(self.train_cfg.pseudo_label_initial_score_thr, float):
-            thr = self.train_cfg.pseudo_label_initial_score_thr
-        else:
-            # TODO: use dynamic threshold
-            raise NotImplementedError("Dynamic Threshold is not implemented yet.")
-        proposal_list, proposal_label_list, _ = list(
-            zip(
-                *[
-                    filter_invalid(
-                        proposal,
-                        proposal_label,
-                        proposal[:, -1],
-                        thr=thr,
-                        min_size=self.train_cfg.min_pseduo_box_size,
-                    )
-                    for proposal, proposal_label in zip(
-                        proposal_list, proposal_label_list
-                    )
-                ]
+            proposal_list, proposal_label_list = self.teacher.roi_head.simple_test_bboxes(
+                feat, img_metas, proposal_list, self.teacher.test_cfg.rcnn, rescale=False
             )
-        )
-        det_bboxes = proposal_list
-        reg_unc = self.compute_uncertainty_with_aug(
-            feat, img_metas, proposal_list, proposal_label_list
+                    
+            proposal_list = [p.to(feat[0].device) for p in proposal_list]
+            proposal_list = [
+                p if p.shape[0] > 0 else p.new_zeros(0, 5) for p in proposal_list
+            ]
+            proposal_label_list = [p.to(feat[0].device) for p in proposal_label_list]
+
+            # filter invalid box roughly
+            if isinstance(self.train_cfg.pseudo_label_initial_score_thr, float):
+                thr = self.train_cfg.pseudo_label_initial_score_thr
+            else:
+                # TODO: use dynamic threshold
+                raise NotImplementedError("Dynamic Threshold is not implemented yet.")
+            proposal_list, proposal_label_list, _ = list(
+                zip(
+                    *[
+                        filter_invalid(
+                            proposal,
+                            proposal_label,
+                            proposal[:, -1],
+                            thr=thr,
+                            min_size=self.train_cfg.min_pseduo_box_size,
+                        )
+                        for proposal, proposal_label in zip(
+                            proposal_list, proposal_label_list
+                        )
+                    ]
+                )
+            )
+
+            if i == 0:
+                teacher_info["backbone_feature"] = feat
+                det_bboxes = proposal_list
+                det_labels = proposal_label_list
+
+            noise_levels_proposal_list.append(proposal_list)
+            noise_levels_proposal_label_list.append(proposal_label_list)
+
+        reg_unc = self.compute_uncertainty(
+            noise_levels_proposal_list, noise_levels_proposal_label_list
         )
         det_bboxes = [
-            torch.cat([bbox, unc], dim=-1) for bbox, unc in zip(det_bboxes, reg_unc)
-        ]
-        det_labels = proposal_label_list
+                    torch.cat([bbox, unc], dim=-1) for bbox, unc in zip(det_bboxes, reg_unc)
+                ]
+
         teacher_info["det_bboxes"] = det_bboxes
         teacher_info["det_labels"] = det_labels
         teacher_info["transform_matrix"] = [
@@ -460,6 +579,7 @@ class SoftTeacher(MultiSteamDetector):
             for unc, wh in zip(box_unc, box_shape)
         ]
         return box_unc
+    
 
     @staticmethod
     def aug_box(boxes, times=1, frac=0.06):
